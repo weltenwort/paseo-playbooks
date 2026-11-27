@@ -6,7 +6,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Pressable, Text, View } from "react-native";
 import { archiveRunRpc, cancelRunRpc, createExampleRpc, listPlaybooks, listRuns, overrideQuotaRpc, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
-import { isActive, isPaused, isPipeline, isTerminal, workspaceKeptUntil, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
+import { isActive, isPaused, isPipeline, isTerminal, workspaceKeptUntil, type Playbook, type PlaybookEntry, type ProfileInfo, type Run } from "../shared/types";
 import { slowView } from "../shared/slow";
 import { useSlowSteps } from "./slow";
 import { NowProvider } from "./now";
@@ -147,7 +147,7 @@ export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
 function ProfileBar(props: {
   theme: Theme;
   projectId: string;
-  profiles: Array<{ id: string; active: boolean; playbooks: number; errors: string[] }>;
+  profiles: ProfileInfo[];
   diagnostics: string[];
   pad: number;
   onToggle: (projectId: string, profile: string, active: boolean) => void;

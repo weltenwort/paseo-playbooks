@@ -29,7 +29,8 @@ import { AgentSettingsSchema, type AgentTarget, DEFAULT_EXHAUSTED_FOR_MS, DEFAUL
 import { BusError, checkTypes, FilterValueSchema } from "./bus";
 import { JOB_TYPES } from "./job-events";
 import { OVERSIGHT_TYPES } from "./oversight-events";
-import { gateReleaseMsOf, noteDeprecatedKey, quotaLimitsLayerOf, readProjectDefault, readProjectProfiles, type QuotaLimitsLayer } from "./config";
+import { gateReleaseMsOf, noteDeprecatedKey, quotaLimitsLayerOf, readExternalRepositories, readProjectDefault, readProjectProfiles, type QuotaLimitsLayer } from "./config";
+import { homedir } from "node:os";
 import { dayNumbers, parseClock, validTimezone, type ClosedHours } from "./closed-hours";
 import { bareId, DEFAULT_REPO, qualified } from "../shared/repos";
 import { MAX_SUBAGENT_ARCHIVE_AFTER_MS } from "./sidekick-archive";
@@ -1378,9 +1379,9 @@ export interface SidekickSubagents {
 export interface SidekickLoad {
   /** A `sidekick/` folder exists in a profile of the project or in a playbooks folder. Without it the project has no Sidekick. */
   configured: boolean;
-  /** Folder of the Sidekick, relative to the workspace (`.paseo/plugins/playbooks/sidekick`, or `.../profiles/<id>/sidekick`). */
+  /** Folder of the Sidekick, relative to the workspace (`.paseo/plugins/playbooks/sidekick`, or `.../profiles/<id>/sidekick`), or an external repository's (`~/src/my-playbooks/sidekick`). */
   dir: string | null;
-  /** The profile whose `sidekick/` was read (its defaults apply); null for the playbooks folder itself. */
+  /** The profile or external repository whose `sidekick/` was read (its defaults apply); null for the playbooks folder itself. */
   profile: string | null;
   config: SidekickConfig | null;
   /** `sidekick/instructions.md`, trimmed; null when there is none. */
@@ -1405,26 +1406,46 @@ export interface SidekickLoadOptions {
 /**
  * The Sidekick of a project: `sidekick/sidekick.yaml` and `sidekick/instructions.md`. Looked for in the project's ACTIVE
  * profiles first (`profiles/<id>/sidekick/`, ids sorted alphabetically: the first wins, the others are named in a warning), then in the
- * first playbooks folder that has a `sidekick/` directory (the legacy location, read as before). The profile that holds
+ * first playbooks folder that has a `sidekick/` directory (the legacy location, read as before), then in the first external
+ * repository (user config order) that has one. The profile that holds
  * it supplies its tiers, `agent_rules` and `providers`. A directory, so it never takes the id of a playbook.
  */
 export async function loadSidekick(workspaceDir: string, options: SidekickLoadOptions = {}): Promise<SidekickLoad> {
   const profilesRel = `${PLAYBOOKS_DIRS[0]}/${PROFILES_DIR}`;
   const requested = options.activeProfiles ?? (options.projectId ? await readProjectProfiles(options.projectId) : []);
+  const external = (await scanExternal()).found;
+  const externalIds = new Set(external.map((repo) => repo.id));
   const inProfiles: string[] = [];
   for (const { name, root } of (await scanProfiles(workspaceDir)).found) {
+    // A profile named like an external repository is not loaded at all (clashNote): its Sidekick neither.
+    if (externalIds.has(name)) continue;
     if (requested.includes(name) && (await listFolder(path.join(root, "sidekick"))) !== null) inProfiles.push(name);
   }
   const legacy: string[] = [];
   for (const relDir of PLAYBOOKS_DIRS) if ((await listFolder(path.join(workspaceDir, relDir, "sidekick"))) !== null) legacy.push(relDir);
+  const inExternal: ExternalFound[] = [];
+  for (const repo of external) if (repo.files !== null && (await listFolder(path.join(repo.root, "sidekick"))) !== null) inExternal.push(repo);
   const notes: string[] = [];
+  const externalIgnored = (winner: string) => {
+    if (inExternal.length > 0) notes.push(`the sidekick/ folder of the external ${inExternal.length === 1 ? "repository" : "repositories"} ${inExternal.map((repo) => `\`${repo.id}\``).join(", ")} is ignored: ${winner} comes first`);
+  };
   if (inProfiles.length > 0) {
     const [first, ...others] = inProfiles;
     if (others.length > 0) notes.push(`${profilesRel}/${first}/sidekick is the project's Sidekick: the active profiles ${others.map((name) => `\`${name}\``).join(", ")} also have a sidekick/ folder, which is ignored (turn those profiles off, or remove the folder)`);
     if (legacy.length > 0) notes.push(`${legacy[0]}/sidekick is ignored: the active profile \`${first}\` has its own sidekick/ folder`);
+    externalIgnored(`the active profile \`${first}\``);
     return readSidekickDir(`${profilesRel}/${first}`, path.join(workspaceDir, profilesRel, first!), first!, notes);
   }
-  if (legacy.length > 0) return readSidekickDir(legacy[0]!, path.join(workspaceDir, legacy[0]!), null, notes);
+  if (legacy.length > 0) {
+    externalIgnored(`the project's ${legacy[0]}/sidekick`);
+    return readSidekickDir(legacy[0]!, path.join(workspaceDir, legacy[0]!), null, notes);
+  }
+  // Last: the first external repository (config order) with a sidekick/ folder; its defaults apply, like a profile's.
+  if (inExternal.length > 0) {
+    const [first, ...others] = inExternal;
+    if (others.length > 0) notes.push(`${first!.display}/sidekick is the project's Sidekick: the external repositories ${others.map((repo) => `\`${repo.id}\``).join(", ")} also have a sidekick/ folder, which is ignored`);
+    return readSidekickDir(first!.display, first!.root, first!.id, notes);
+  }
   return NO_SIDEKICK;
 }
 
@@ -1523,28 +1544,26 @@ async function readSidekickDir(repoRel: string, repoRoot: string, profile: strin
 }
 
 /** True when the workspace has at least one playbook file in any playbook folder. */
-/** `reload_stale_sessions` of the workspace's `defaults/main.yaml` (the first playbooks folder that has one); true when unset. */
+/** `reload_stale_sessions` of the workspace's `defaults/main.yaml` (the first playbooks folder that has one, then the external repositories'); true when unset. */
 export async function reloadStaleSessionsSetting(workspaceDir: string): Promise<boolean> {
-  for (const relDir of PLAYBOOKS_DIRS) {
-    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
-    if ((await readText(file)) === null) continue;
-    const raw = await readYaml(file, `${relDir}/defaults/main.yaml`);
+  for (const { file, rel } of await settingsFiles(workspaceDir)) {
+    const raw = await readYaml(file, rel);
     if ("error" in raw) return true;
     const parsed = RawDefaultsSchema.safeParse(raw.value);
-    return parsed.success ? (parsed.data.reload_stale_sessions ?? true) : true;
+    if (!parsed.success) return true;
+    if (parsed.data.reload_stale_sessions !== undefined) return parsed.data.reload_stale_sessions;
   }
   return true;
 }
 
 /** The warden settings of the workspace's `defaults/main.yaml` for the PR checks: null unless `warden.enabled` and a `pr_checks` check is set (or when the file is invalid). */
 export async function wardenPrSetting(workspaceDir: string): Promise<{ intervalMs: number; cooldownMs: number; checks: WardenPrConfig; closedHours: ClosedHours | null | undefined } | null> {
-  for (const relDir of PLAYBOOKS_DIRS) {
-    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
-    if ((await readText(file)) === null) continue;
-    const raw = await readYaml(file, `${relDir}/defaults/main.yaml`);
+  for (const { file, rel } of await settingsFiles(workspaceDir)) {
+    const raw = await readYaml(file, rel);
     if ("error" in raw) return null;
     const parsed = RawDefaultsSchema.safeParse(raw.value);
-    if (!parsed.success || !parsed.data.warden) return null;
+    if (!parsed.success) return null;
+    if (!parsed.data.warden) continue;
     let failed = false;
     const fail = () => void (failed = true);
     const warden = resolveWarden(parsed.data.warden, DEFAULT_WARDEN, "warden", fail);
@@ -1555,20 +1574,56 @@ export async function wardenPrSetting(workspaceDir: string): Promise<{ intervalM
   return null;
 }
 
-/** `gates.on_behalf` of the workspace's `defaults/main.yaml` (the first playbooks folder that has one); `allow` when unset. */
+/** `gates.on_behalf` of the workspace's `defaults/main.yaml` (the first playbooks folder that has one, then the external repositories'); `allow` when unset. */
 export async function gatesOnBehalfSetting(workspaceDir: string): Promise<"allow" | "deny"> {
-  for (const relDir of PLAYBOOKS_DIRS) {
-    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
-    if ((await readText(file)) === null) continue;
-    const raw = await readYaml(file, `${relDir}/defaults/main.yaml`);
+  for (const { file, rel } of await settingsFiles(workspaceDir)) {
+    const raw = await readYaml(file, rel);
     if ("error" in raw) return "allow";
     const parsed = RawDefaultsSchema.safeParse(raw.value);
-    return parsed.success ? (parsed.data.gates?.on_behalf ?? "allow") : "allow";
+    if (!parsed.success) return "allow";
+    if (parsed.data.gates?.on_behalf !== undefined) return parsed.data.gates.on_behalf;
   }
   return "allow";
 }
 
+/**
+ * The `defaults/main.yaml` files a project-level setting is read from, in order: the workspace's (the first playbooks
+ * folder that has one), then each external repository's (config order). The first that sets the value decides.
+ */
+async function settingsFiles(workspaceDir: string): Promise<Array<{ file: string; rel: string }>> {
+  const files: Array<{ file: string; rel: string }> = [];
+  for (const relDir of PLAYBOOKS_DIRS) {
+    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
+    if ((await readText(file)) === null) continue;
+    files.push({ file, rel: `${relDir}/defaults/main.yaml` });
+    break;
+  }
+  for (const repo of (await scanExternal()).found) {
+    const file = path.join(repo.root, "defaults", "main.yaml");
+    if (repo.files !== null && (await readText(file)) !== null) files.push({ file, rel: `${repo.display}/defaults/main.yaml` });
+  }
+  return files;
+}
+
+/**
+ * Which playbook tools an agent working in `dir` gets (ADR 2026-11-26-external-playbook-repositories): `own` (the
+ * workspace has playbooks of its own: the full manager tools), `external` (only external repositories have some:
+ * list_playbooks and start_playbook), or `none`.
+ */
+export async function playbookAccess(dir: string): Promise<"own" | "external" | "none"> {
+  if (await hasOwnPlaybooks(dir)) return "own";
+  return (await hasPlaybooks(dir)) ? "external" : "none";
+}
+
+/** True when the workspace's own folders (playbooks folders or profiles) have a playbook file, or an external repository has one. */
 export async function hasPlaybooks(workspaceDir: string): Promise<boolean> {
+  if (await hasOwnPlaybooks(workspaceDir)) return true;
+  // External repositories are active in every workspace.
+  return (await scanExternal()).found.some((repo) => repo.files?.some((file) => /\.ya?ml$/.test(file)));
+}
+
+/** True when the workspace's own folders (playbooks folders or profiles) have a playbook file; external repositories do not count. */
+export async function hasOwnPlaybooks(workspaceDir: string): Promise<boolean> {
   for (const relDir of PLAYBOOKS_DIRS) {
     try {
       const names = await readdir(path.join(workspaceDir, relDir));
@@ -1577,9 +1632,12 @@ export async function hasPlaybooks(workspaceDir: string): Promise<boolean> {
       // Folder absent.
     }
   }
-  // A workspace with only profiles still shows the screen, so they can be turned on.
+  // A workspace with only profiles still shows the screen, so they can be turned on. A profile named like an external
+  // repository is never loaded (clashNote), so it does not count.
   const profiles = (await listFolder(path.join(workspaceDir, PLAYBOOKS_DIRS[0], PROFILES_DIR))) ?? [];
+  const externalIds = profiles.length > 0 ? new Set((await scanExternal()).found.map((repo) => repo.id)) : new Set<string>();
   for (const name of profiles) {
+    if (externalIds.has(name)) continue;
     const files = await listFolder(path.join(workspaceDir, PLAYBOOKS_DIRS[0], PROFILES_DIR, name));
     if (files?.some((file) => /\.ya?ml$/.test(file))) return true;
   }
@@ -1598,8 +1656,13 @@ async function listFolder(root: string): Promise<string[] | null> {
 /** Folder of the profiles, inside the primary playbooks folder: `profiles/<id>/` is a repository like the folder itself. */
 const PROFILES_DIR = "profiles";
 
+/** A profile named like an external repository: the external one is global, so the profile is not loaded. */
+function clashNote(name: string): string {
+  return `${PLAYBOOKS_DIRS[0]}/${PROFILES_DIR}/${name}: ignored, an external repository of the user config is also named \`${name}\` (rename one of them)`;
+}
+
 /** Loads one repository folder (the playbooks folder itself, or a profile): its entries, using its own roles/, defaults/ and scripts/. */
-async function loadRepo(repo: string, root: string, relDir: string, names: string[]): Promise<PlaybookEntry[]> {
+async function loadRepo(repo: string, root: string, relDir: string, names: string[], external = false): Promise<PlaybookEntry[]> {
   const entries: PlaybookEntry[] = [];
   const files = names.filter((name) => /\.ya?ml$/.test(name)).sort();
   const { defaults, errors: mainErrors } = await loadDefaults(root, relDir);
@@ -1615,6 +1678,7 @@ async function loadRepo(repo: string, root: string, relDir: string, names: strin
     root,
     relDir,
     repo,
+    external,
     defaults,
     managerText,
     role,
@@ -1637,6 +1701,83 @@ async function loadRepo(repo: string, root: string, relDir: string, names: strin
     entries.push(entry);
   }
   return entries;
+}
+
+/** One external repository of the user config, as found on disk (`files` null when its folder is missing). */
+interface ExternalFound {
+  id: string;
+  /** Absolute folder. */
+  root: string;
+  /** The folder for labels and messages, `~` for the home folder. */
+  display: string;
+  /** As registered in the config. */
+  path: string;
+  files: string[] | null;
+  problem: string | null;
+}
+
+/** `/home/me/x` → `~/x`, for labels. */
+function tildify(dir: string): string {
+  const home = homedir();
+  return dir === home ? "~" : dir.startsWith(`${home}${path.sep}`) ? `~${dir.slice(home.length)}` : dir;
+}
+
+/**
+ * The external repositories of this host (`repositories` of the user config, ADR 2026-11-26-external-playbook-repositories),
+ * in config order, with a note for each malformed entry, missing folder or folder without playbooks.
+ */
+export async function scanExternal(): Promise<{ found: ExternalFound[]; diagnostics: string[]; configProblems: string[] }> {
+  const { repositories, problems } = await readExternalRepositories();
+  const configProblems = problems.map((problem) => `user config ${problem}`);
+  const diagnostics = [...configProblems];
+  const found: ExternalFound[] = [];
+  for (const { id, path: written, resolved } of repositories) {
+    const display = tildify(resolved);
+    const files = await listFolder(resolved);
+    let problem: string | null = null;
+    if (files === null) problem = `folder ${display} not found (clone the repository there, or fix \`repositories.${id}.path\` in the user config)`;
+    else if (!files.some((file) => /\.ya?ml$/.test(file))) problem = `no playbook files in ${display}`;
+    if (problem) diagnostics.push(`external repository \`${id}\`: ${problem}`);
+    found.push({ id, root: resolved, display, path: written, files, problem });
+  }
+  return { found, diagnostics, configProblems };
+}
+
+/** The external repositories with their state, for the Profiles tab. */
+export async function listExternalRepositories(): Promise<{ repositories: Array<{ id: string; path: string; resolved: string; playbooks: number; problem: string | null }>; problems: string[] }> {
+  const { found, configProblems } = await scanExternal();
+  return {
+    repositories: found.map((repo) => ({ id: repo.id, path: repo.path, resolved: repo.root, playbooks: (repo.files ?? []).filter((file) => /\.ya?ml$/.test(file)).length, problem: repo.problem })),
+    problems: configProblems,
+  };
+}
+
+/**
+ * `dir` laid out as a repository itself (a registered external repository's folder, or a folder with `roles/` at its root, and no
+ * `.paseo/` playbooks folder): a clone
+ * or worktree of an external repository. Loaded alone, under the id of the registered repository at that folder, else
+ * the folder's name, so an agent can validate edits before they reach the registered clone. Null for any other folder.
+ */
+export async function loadRepositoryFolder(dir: string): Promise<LoadResult | null> {
+  for (const relDir of PLAYBOOKS_DIRS) if ((await listFolder(path.join(dir, relDir))) !== null) return null;
+  const names = await listFolder(dir);
+  if (names === null) return null;
+  const root = path.resolve(dir);
+  const registered = (await scanExternal()).found.find((repo) => repo.root === root);
+  // A YAML file at a project's root (compose.yaml, a CI file) proves nothing: an unregistered folder must also have roles/.
+  if (!registered && !(names.includes("roles") && (await listFolder(path.join(root, "roles"))) !== null)) return null;
+  const fallbackId = path.basename(root).toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^[^a-z]+/, "") || "repository";
+  const id = registered?.id ?? fallbackId;
+  const display = tildify(root);
+  const entries = await loadRepo(id, root, display, names, true);
+  const sidekick = (await listFolder(path.join(root, "sidekick"))) !== null ? await readSidekickDir(display, root, id, []) : NO_SIDEKICK;
+  const info: ProfileInfo = { id, active: true, playbooks: names.filter((name) => /\.ya?ml$/.test(name)).length, errors: [], source: "external", path: display };
+  return { roots: [root], exists: true, entries, sidekick, profiles: [info], defaultActive: false, diagnostics: [] };
+}
+
+/** The repository list entry of an external repository: always active. */
+function externalInfo(repo: ExternalFound): ProfileInfo {
+  return { id: repo.id, active: true, playbooks: (repo.files ?? []).filter((file) => /\.ya?ml$/.test(file)).length, errors: repo.problem && repo.files === null ? [repo.problem] : [], source: "external", path: repo.path };
 }
 
 /** The valid profile folders of a checkout (sorted), and a note for each folder that is not one. */
@@ -1665,12 +1806,20 @@ async function scanProfiles(dir: string): Promise<{ found: Array<{ name: string;
 export async function projectProfiles(root: string, projectId: string): Promise<{ profiles: ProfileInfo[]; diagnostics: string[] }> {
   const active = await readProjectProfiles(projectId);
   const { found, diagnostics } = await scanProfiles(root);
+  const external = await scanExternal();
+  const externalIds = new Set(external.found.map((repo) => repo.id));
   let defaultPlaybooks = 0;
   for (const relDir of PLAYBOOKS_DIRS) defaultPlaybooks += ((await listFolder(path.join(root, relDir))) ?? []).filter((file) => /\.ya?ml$/.test(file)).length;
-  return {
-    profiles: [{ id: DEFAULT_REPO, active: await readProjectDefault(projectId), playbooks: defaultPlaybooks, errors: [] }].concat(found.map(({ name, files }) => ({ id: name, active: active.includes(name), playbooks: files.filter((file) => /\.ya?ml$/.test(file)).length, errors: [] }))),
-    diagnostics,
-  };
+  const profiles: ProfileInfo[] = [{ id: DEFAULT_REPO, active: await readProjectDefault(projectId), playbooks: defaultPlaybooks, errors: [], source: "workspace" }];
+  for (const { name, files } of found) {
+    if (externalIds.has(name)) {
+      diagnostics.push(clashNote(name));
+      continue;
+    }
+    profiles.push({ id: name, active: active.includes(name), playbooks: files.filter((file) => /\.ya?ml$/.test(file)).length, errors: [], source: "workspace" });
+  }
+  profiles.push(...external.found.map(externalInfo));
+  return { profiles, diagnostics: [...diagnostics, ...external.diagnostics] };
 }
 
 export interface LoadOptions {
@@ -1716,10 +1865,16 @@ export async function loadPlaybooks(workspaceDir: string, options: LoadOptions =
   const requested = options.activeProfiles ?? (options.projectId ? await readProjectProfiles(options.projectId) : []);
   const scan = await scanProfiles(workspaceDir);
   diagnostics.push(...scan.diagnostics);
+  const external = await scanExternal();
+  const externalIds = new Set(external.found.map((repo) => repo.id));
   // An id with no folder here (it may live in the project's main checkout only) is ignored.
   for (const { name, root, files } of scan.found) {
+    if (externalIds.has(name)) {
+      diagnostics.push(clashNote(name));
+      continue;
+    }
     const active = requested.includes(name);
-    const info: ProfileInfo = { id: name, active, playbooks: files.filter((file) => /\.ya?ml$/.test(file)).length, errors: [] };
+    const info: ProfileInfo = { id: name, active, playbooks: files.filter((file) => /\.ya?ml$/.test(file)).length, errors: [], source: "workspace" };
     profiles.push(info);
     if (info.playbooks === 0) diagnostics.push(`${profilesRel}/${name}: no playbook files`);
     if (!active) continue;
@@ -1729,6 +1884,19 @@ export async function loadPlaybooks(workspaceDir: string, options: LoadOptions =
     } catch (error) {
       info.errors.push(`could not load: ${error instanceof Error ? error.message : String(error)}`);
       diagnostics.push(`${profilesRel}/${name}: could not load: ${info.errors[0]}`);
+    }
+  }
+  // External repositories (user config): always active, in every project, whatever the workspace.
+  diagnostics.push(...external.diagnostics);
+  for (const repo of external.found) {
+    const info = externalInfo(repo);
+    profiles.push(info);
+    if (repo.files === null) continue;
+    try {
+      entries.push(...(await loadRepo(repo.id, repo.root, repo.display, repo.files, true)));
+    } catch (error) {
+      info.errors.push(`could not load: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.push(`external repository \`${repo.id}\`: could not load: ${info.errors[0]}`);
     }
   }
   // Same bare id in several repositories: both stay (qualified), but a bare reference to it is ambiguous.
@@ -1758,8 +1926,10 @@ async function checkScript(root: string, name: string): Promise<{ name: string }
 interface Folder {
   root: string;
   relDir: string;
-  /** The repository: `default` for the playbooks folders, a profile's id otherwise. */
+  /** The repository: `default` for the playbooks folders, a profile's or an external repository's id otherwise. */
   repo: string;
+  /** An external repository: `root` is outside the workspace, so script paths are stored absolute. */
+  external: boolean;
   defaults: RawDefaults;
   /** `defaults/manager.md`, trimmed. */
   managerText: string | null;
@@ -1770,6 +1940,14 @@ interface Folder {
 }
 
 type Loaded = { entry: PlaybookEntry };
+
+/**
+ * Where a script step's file is recorded: `<relDir>/scripts/<name>`, relative to the run's checkout, for a repository of
+ * the workspace; the absolute path for an external repository, which no checkout holds.
+ */
+function scriptPath(folder: Folder, name: string): string {
+  return folder.external ? path.join(folder.root, "scripts", name) : `${folder.relDir}/scripts/${name}`;
+}
 
 /** The id a repository's playbook goes by: bare in the default repository, `profile:id` in a profile. */
 export function qualifyId(repo: string, id: string): string {
@@ -2254,7 +2432,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (scriptStep) {
       const checked = await checkScript(root, scriptStep.run);
       if ("error" in checked) err(`${where}: script.run: ${checked.error}`);
-      else script = `${folder.relDir}/scripts/${checked.name}`;
+      else script = scriptPath(folder, checked.name);
       if (scriptStep.poll !== undefined) {
         pollMs = parseDuration(scriptStep.poll) ?? undefined;
         if (pollMs === undefined) err(`${where}: script.poll: expected a duration such as 30s or 1m`);
@@ -2568,7 +2746,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         if (rawAdmit.poll === undefined) err(`${where} needs \`poll\`: events are a hint, the poll is the safety net (write \`queue: { admit: { script: ${rawAdmit.script}, poll: 10m } }\`)`);
         else if (pollMs === null) err(`${where}.poll: expected a duration such as 30s or 10m`);
         const wakeOn = rawAdmit.wake_on ? checkWakeOn(rawAdmit.wake_on, `${where}.wake_on`, err) : [];
-        if (!("error" in checked) && pollMs !== null) admit = { script: `${folder.relDir}/scripts/${checked.name}`, pollMs, wakeOn };
+        if (!("error" in checked) && pollMs !== null) admit = { script: scriptPath(folder, checked.name), pollMs, wakeOn };
       }
       // The effects of the stage's `settle` steps: one meaning per outcome across the stage.
       const effects: Stage["effects"] = {};
@@ -2684,6 +2862,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     slowWarning: { runs: pb.slow_warning?.runs ?? defaults.slow_warning?.runs ?? DEFAULT_SLOW_WARNING.runs, factor: pb.slow_warning?.factor ?? defaults.slow_warning?.factor ?? DEFAULT_SLOW_WARNING.factor },
     agentRules: mergeAgentRules(defaults.agentRules ?? [], ownRules.rules, [...blocks.values()]),
     managerInstructions: managerInstructions(folder.managerText, qid, pb.manager?.prompt, [...blocks.values()]),
+    ...(folder.external ? { external: { root: folder.root } } : {}),
     outcomes: playbookOutcomes,
     autoArchive: { enabled: pb.auto_archive?.enabled ?? defaults.auto_archive?.enabled ?? false, afterMs: parseDuration(pb.auto_archive?.after ?? defaults.auto_archive?.after ?? "") ?? DEFAULT_AUTO_ARCHIVE_AFTER_MS, keepFailedWorkspaceMs: parseDuration(pb.auto_archive?.keep_failed_workspace ?? defaults.auto_archive?.keep_failed_workspace ?? "") ?? DEFAULT_KEEP_FAILED_WORKSPACE_MS },
     workspace: {

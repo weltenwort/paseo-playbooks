@@ -139,7 +139,8 @@ export function loopCandidates(run: Run, above: number, action: Act): Candidate[
  */
 export function staleDefinitionCandidate(run: Run, originSha: string | null, afterMs: number, now: number, action: Act, closed?: ClosedHours | null): Candidate[] {
   const definition = run.definition;
-  if (!definition || !originSha) return [];
+  // An external repository's definition is not on the project's origin: comparing would always report it.
+  if (!definition || !originSha || definition.source === "external") return [];
   if (onlyWaitingOnGate(run)) return [];
   const aged = openAge(closed, Date.parse(run.createdAt), now) - heldMs(run, now) >= afterMs;
   const stale = definition.source === "workspace" || (aged && definition.sha !== null && definition.sha !== originSha);

@@ -26,11 +26,14 @@ export async function chooseDefinition(input: {
   baseSha: string;
   fetchError: string | null;
 }): Promise<{ playbook: Playbook; definition: RunDefinition }> {
+  // An external repository is not in the project's git: its folder, as it is now, is the source (ADR 2026-11-26-external-playbook-repositories).
+  if (input.playbook.external) return { playbook: input.playbook, definition: { source: "external", ref: null, sha: await externalSha(input.playbook.external.root), note: null, warning: null } };
   const fallback = (note: string, why: string) => ({ playbook: input.playbook, definition: { source: "workspace" as const, ref: null, sha: null, note, warning: workspaceWarning(why) } });
   if (input.fetchError) return fallback(`could not fetch ${input.baseRef} (${input.fetchError}); using the workspace checkout's playbook`, `${input.baseRef} could not be fetched: ${shortReason(input.fetchError)}`);
   let entry: PlaybookEntry | undefined;
   try {
-    entry = (await loadPlaybooks(input.worktreeDir, { projectId: input.projectId })).entries.find((candidate) => candidate.id === input.playbook.id);
+    // The worktree holds the project's own playbooks only: an external repository's entry of the same id is another playbook.
+    entry = (await loadPlaybooks(input.worktreeDir, { projectId: input.projectId })).entries.find((candidate) => candidate.id === input.playbook.id && !candidate.playbook?.external);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     return fallback(`could not read the playbooks of ${input.baseRef} (${reason}); using the workspace checkout's playbook`, `the playbooks of ${input.baseRef} could not be read: ${shortReason(reason)}`);
@@ -39,6 +42,15 @@ export async function chooseDefinition(input: {
   if (!entry.playbook) return fallback(`playbook "${input.playbook.id}" is invalid on ${input.baseRef} (${entry.errors[0] ?? "unknown error"}); using the workspace checkout's`, `${input.baseRef} is invalid: ${shortReason(entry.errors[0] ?? "unknown error")}`);
   if (!isAdoptable(entry)) return fallback(`playbook "${input.playbook.id}" on ${input.baseRef} is no longer an isolated, non-singleton playbook; using the workspace checkout's`, `"${input.playbook.id}" on ${input.baseRef} is no longer an isolated, non-singleton playbook`);
   return { playbook: entry.playbook, definition: { source: "origin", ref: input.baseRef, sha: input.baseSha, note: null, warning: null } };
+}
+
+/** The commit an external repository's folder is at, or null when it is not a git checkout. */
+export async function externalSha(root: string): Promise<string | null> {
+  try {
+    return (await exec("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 /** The first line of an error, cut to a short reason a warning can carry. */
@@ -72,8 +84,8 @@ export function definitionMismatch(pinned: Playbook, next: Playbook): string | n
 
 export interface ResolvedEntry {
   entry: PlaybookEntry;
-  /** What a new run would load: `origin` (fresh base, isolated playbooks) or the `workspace` checkout. */
-  source: "origin" | "workspace";
+  /** What a new run would load: `origin` (fresh base, isolated playbooks), the `workspace` checkout, or an `external` repository's folder. */
+  source: "origin" | "workspace" | "external";
   ref?: string;
   note?: string;
 }
@@ -108,13 +120,17 @@ async function loadAtRef(dir: string, base: string, activeProfiles: string[], de
 export async function resolveForNewRun(workspaceDir: string, workspace: LoadResult): Promise<ResolvedEntry[]> {
   const bases = new Map<string, string | null>();
   for (const entry of workspace.entries) {
-    if (!isAdoptable(entry)) continue;
+    if (!isAdoptable(entry) || entry.playbook.external) continue;
     bases.set(entry.id, entry.playbook.isolation.base ?? (await defaultBranch(workspaceDir)));
   }
-  const activeProfiles = workspace.profiles.filter((profile) => profile.active).map((profile) => profile.id);
+  const activeProfiles = workspace.profiles.filter((profile) => profile.active && profile.source !== "external").map((profile) => profile.id);
   const cache = new Map<string, Awaited<ReturnType<typeof loadAtRef>>>();
   const out: ResolvedEntry[] = [];
   for (const entry of workspace.entries) {
+    if (entry.playbook?.external) {
+      out.push({ entry, source: "external" });
+      continue;
+    }
     const base = bases.get(entry.id);
     if (!base) {
       out.push({ entry, source: "workspace" });
@@ -126,7 +142,7 @@ export async function resolveForNewRun(workspaceDir: string, workspace: LoadResu
       out.push({ entry, source: "workspace", note: `${fresh.error}; a new run would use the workspace checkout's playbook` });
       continue;
     }
-    const copy = fresh.loaded.entries.find((candidate) => candidate.id === entry.id);
+    const copy = fresh.loaded.entries.find((candidate) => candidate.id === entry.id && !candidate.playbook?.external);
     if (!copy) out.push({ entry, source: "workspace", note: `${fresh.ref} has no playbook "${entry.id}"; a new run would use the workspace checkout's` });
     else if (!copy.playbook) out.push({ entry: copy, source: "origin", ref: fresh.ref, note: `invalid on ${fresh.ref}: a new run would fall back to the workspace checkout's copy (which is valid)` });
     else if (!isAdoptable(copy)) out.push({ entry, source: "workspace", note: `on ${fresh.ref} it is no longer an isolated, non-singleton playbook; a new run would use the workspace checkout's` });

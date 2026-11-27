@@ -10,7 +10,7 @@ import { repairReport } from "./malformed";
 import { isActive, isAgentlessAttempt, isPaused, isPipeline, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema, workspaceKeptUntil } from "../shared/types";
 import * as engine from "./engine";
 import { resolveForNewRun } from "./fresh";
-import { hasPlaybooks, loadPlaybooks } from "./loader";
+import { hasOwnPlaybooks, loadPlaybooks, loadRepositoryFolder } from "./loader";
 import { conversationText } from "./conversation";
 import { attentionText } from "./overseer";
 import { MANAGER_PROTOCOL, managerAddedText, worktreePreamble } from "./prompts";
@@ -424,12 +424,13 @@ export function definitionNote(run: Pick<Run, "definition">): string {
   const def = run.definition;
   if (!def) return "";
   if (def.source === "origin") return `\nPlaybook definition and roles: read from ${def.ref} at ${def.sha?.slice(0, 10) ?? "?"} (fetched at start), not from the workspace checkout.`;
+  if (def.source === "external") return `\nPlaybook definition and roles: read from an external repository's folder${def.sha ? ` at ${def.sha.slice(0, 10)}` : ""}, not from the workspace checkout; its scripts run from a copy taken at start.`;
   return `\nWARNING: playbook definition and roles come from the workspace checkout, which may be behind origin: ${def.note ?? "no fresh copy was used"}.`;
 }
 
 /** The result line of refresh_scripts and of restart_run's refresh: what was refreshed, from which source, and any warning. */
 export function refreshText(runId: string, result: RefreshResult): string {
-  const from = result.source === "origin" ? result.ref : "the workspace checkout (origin's playbook is not usable)";
+  const from = result.source === "origin" ? result.ref : result.source === "external" ? result.ref : "the workspace checkout (origin's playbook is not usable)";
   const head = result.changed ? `Scripts of run ${runId} refreshed from ${from}: ${result.before ?? "pinned copy"} -> ${result.sha}.` : `Nothing changed: scripts of run ${runId} already are ${result.sha} (${from}).`;
   const def = result.definition === "refreshed" ? " The definition was re-read from the same source." : result.definition === "unchanged" ? " The definition is already the current one." : "";
   return `${head}${def}${result.note ? ` WARNING: ${result.note}.` : ""}`;
@@ -439,6 +440,17 @@ export function refreshText(runId: string, result: RefreshResult): string {
 export const SIDEKICK_MANAGER_TOOLS = ["list_playbooks", "start_playbook", "replace_child"];
 
 /** The part of the manager tools given to a Sidekick: list_playbooks and start_playbook (with workspaceId, newWorkspace, forJob). */
+/**
+ * What an agent gets in a workspace whose only playbooks come from external repositories: see and start them, never the
+ * rest of a manager's tools (ADR 2026-11-26-external-playbook-repositories). start_playbook gives such an agent's runs a
+ * Playbook Manager of their own, which the plugin creates with the full tools, so it never has to manage one itself.
+ */
+export const EXTERNAL_START_TOOLS = ["list_playbooks", "start_playbook"];
+
+export function externalStartTools(runtime: Runtime): AgentToolDefinition[] {
+  return managerTools(runtime).filter((tool) => EXTERNAL_START_TOOLS.includes(tool.name));
+}
+
 export function sidekickStartTools(runtime: Runtime): AgentToolDefinition[] {
   return managerTools(runtime).filter((tool) => SIDEKICK_MANAGER_TOOLS.includes(tool.name));
 }
@@ -1162,8 +1174,8 @@ export function runTools(runtime: Runtime): AgentToolDefinition[] {
       }),
       execute: ({ runId, stepId, note, takeOver, workspaceId, model, thinking, refresh }, { agent }) =>
         guard(async () => {
-          // A taker needs the manager tools, which agents get in a workspace with playbooks.
-          if (takeOver && runtime.runsOfManager(agent.id).length === 0 && !(await hasPlaybooks(agent.cwd))) {
+          // A taker needs the manager tools, which agents get in a workspace with playbooks of its own (external ones give only list_playbooks and start_playbook).
+          if (takeOver && runtime.runsOfManager(agent.id).length === 0 && !(await hasOwnPlaybooks(agent.cwd))) {
             throw new UserError("you do not have the manager tools (your workspace has no playbooks): omit takeOver and a Playbook Manager is found for the run");
           }
           const restarted = await runtime.restartRun(runId, stepId, note?.trim() || null, agent.id, "agent", takeOver ? { id: agent.id, workspaceId: agent.workspaceId } : undefined, workspaceId, modelChoice(model, thinking), refresh ? { reason: `restart_run from "${stepId}"` } : undefined);
@@ -1240,9 +1252,9 @@ export function validateTool(runtime: Runtime): AgentToolDefinition {
   return defineAgentTool({
     name: "validate_playbooks",
     description:
-      'Validate the playbooks in <workspace>/.paseo/plugins/playbooks/ and <workspace>/.paseo/playbooks/ (or in the given workspace folder) with the same checks as the Playbooks panel. Writes nothing. Compact by default (results[]: id, valid, errors); view "full" returns every playbook in detail (can exceed the tool-result limit: use playbookId with it).',
+      'Validate the playbooks in <workspace>/.paseo/plugins/playbooks/ and <workspace>/.paseo/playbooks/ (or in the given workspace folder), plus the external repositories of the user config, with the same checks as the Playbooks panel. A folder laid out as a repository itself (a registered external repository, or a folder with roles/ at its root and no .paseo/ playbooks folder, such as a clone of an external repository) is validated alone. Writes nothing. Compact by default (results[]: id, valid, errors); view "full" returns every playbook in detail (can exceed the tool-result limit: use playbookId with it).',
     input: z.object({
-      path: z.string().optional().describe("Workspace folder to check; defaults to yours. Changes only the root; active profiles still come from your workspace project"),
+      path: z.string().optional().describe("Workspace folder, or external repository folder, to check; defaults to yours. Changes only the root; active profiles still come from your workspace project"),
       view: PlaybookViewSchema,
       playbookId: z.string().optional().describe("Only this playbook"),
     }),
@@ -1250,7 +1262,8 @@ export function validateTool(runtime: Runtime): AgentToolDefinition {
       guard(async () => {
         const dir = path ?? agent.cwd;
         const projectId = await runtime.projectIdOf(agent.workspaceId);
-        const loaded = await loadPlaybooks(dir, projectId ? { projectId } : {});
+        // A folder laid out as a repository itself (a clone of an external repository) is validated alone.
+        const loaded = (await loadRepositoryFolder(dir)) ?? (await loadPlaybooks(dir, projectId ? { projectId } : {}));
         if (!loaded.exists) return ok(`No playbooks folder: create .paseo/plugins/playbooks/ or .paseo/playbooks/ in ${dir}.`, { exists: false, sidekick: { configured: false, errors: [] } });
         // What a new run would load: isolated playbooks come from their fresh base branch, not the checkout.
         const resolved = await resolveForNewRun(dir, loaded);

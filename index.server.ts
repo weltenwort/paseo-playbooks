@@ -28,6 +28,8 @@ import {
   listPlaybooks,
   listProjectProfilesRpc,
   setProfileRpc,
+  listRepositoriesRpc,
+  setRepositoryRpc,
   listRuns,
   stepDetailRpc,
   listWorkspaceAgents,
@@ -52,15 +54,16 @@ import {
 } from "./shared/contracts";
 import { summarizeRun } from "./shared/types";
 import { leanRun, stepDetail } from "./shared/lean";
-import { readEventCoreConfig, setProjectProfile } from "./server/config";
-import { hasPlaybooks, loadPlaybooks, projectProfiles } from "./server/loader";
+import { expandHome, readEventCoreConfig, repositoryIdProblem, repositoryPathProblem, setExternalRepository, setProjectProfile } from "./server/config";
+import { hasPlaybooks, listExternalRepositories, playbookAccess, loadPlaybooks, projectProfiles } from "./server/loader";
+import { stat } from "node:fs/promises";
 import { GATE_LABEL, Runtime, STEP_LABEL, UserError } from "./server/runtime";
 import { saveAttachment } from "./server/attachments";
 import { SIDEKICK_LABEL } from "./server/sidekick";
 import { createSidekickStarter, createStarter } from "./server/starter";
 import { migrateDataDir } from "./server/data-dir";
 import { defaultRunsDir, RunStore } from "./server/store";
-import { deferGateTool, returnGateTool, gateTool, managerTools, resumeGateTool, runTools, sidekickStartTools, sidekickTool, stepTools, validateTool } from "./server/tools";
+import { deferGateTool, externalStartTools, returnGateTool, gateTool, managerTools, resumeGateTool, runTools, sidekickStartTools, sidekickTool, stepTools, validateTool } from "./server/tools";
 
 let safetyNet = false;
 /** One bad call (a refused result, a failed timer) must not take every run's tools down: log it and keep serving. */
@@ -108,9 +111,9 @@ export default function contribute(server: PluginServerContext) {
     });
 
   // Tools: report_step_result and read-only validate_playbooks for step agents; manager tools for agents whose workspace has
-  // playbooks (or that already manage a run); validate_playbooks, list_runs, cancel_run, start_after_task and
+  // playbooks of its own (or that already manage a run), list_playbooks and start_playbook where only external repositories have some; validate_playbooks, list_runs, cancel_run, start_after_task and
   // restart_run and recover_manager for every other agent, so a human can stop, wrap up or restart a run from any chat.
-  const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime), resumeGateTool(runtime), deferGateTool(runtime), returnGateTool(runtime)], step: (managerless: boolean) => stepTools(runtime, managerless), sidekick: sidekickTool(runtime), sidekickStart: sidekickStartTools(runtime), gate: gateTool(runtime) };
+  const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime), resumeGateTool(runtime), deferGateTool(runtime), returnGateTool(runtime)], step: (managerless: boolean) => stepTools(runtime, managerless), sidekick: sidekickTool(runtime), sidekickStart: sidekickStartTools(runtime), externalStart: externalStartTools(runtime), gate: gateTool(runtime) };
   server.before("agent.session_open", async ({ request }, context) => {
     if (request.purpose === "history") return;
     // Only the store is needed here. Do not wait for reconcile: its own sends (resume a step, wake a
@@ -124,7 +127,10 @@ export default function contribute(server: PluginServerContext) {
     // The Sidekick sits on its project's root, which has playbooks: it gets the common tools and list_playbooks / start_playbook, never the rest of a manager's.
     if (request.labels[SIDEKICK_LABEL]) return { ...request, tools: [...request.tools, ...tools.common, ...tools.sidekickStart, tools.sidekick] };
     const manages = runtime.runsOfManager(request.agentId).length > 0 || request.labels["playbooks/manager"] === "true";
-    const extra = manages || runtime.hasReservation(request.workspaceId) || (await hasPlaybooks(request.cwd)) ? tools.manager : [];
+    // Full manager tools where the workspace has playbooks of its own; where its only playbooks are external, just
+    // list_playbooks and start_playbook, so registering an external repository does not load every agent with ~30 tools.
+    const access = manages || runtime.hasReservation(request.workspaceId) ? "own" : await playbookAccess(request.cwd);
+    const extra = access === "own" ? tools.manager : access === "external" ? tools.externalStart : [];
     return { ...request, tools: [...request.tools, ...tools.common, ...extra] };
   });
 
@@ -175,7 +181,31 @@ export default function contribute(server: PluginServerContext) {
     const offered = await projectProfiles(workspace.projectRootPath, workspace.projectId);
     return { ...loaded, projectId: workspace.projectId, profiles: offered.profiles, diagnostics: [...offered.diagnostics, ...loaded.diagnostics.filter((note) => !offered.diagnostics.includes(note))] };
   });
-  handle(setProfileRpc, async ({ projectId, profile, active }) => ({ active: await setProjectProfile(projectId, profile, active) }));
+  handle(setProfileRpc, async ({ projectId, profile, active }) => ({
+    active: await setProjectProfile(projectId, profile, active).catch((error: unknown) => {
+      throw new UserError(error instanceof Error ? error.message : String(error));
+    }),
+  }));
+  handle(listRepositoriesRpc, async () => listExternalRepositories());
+  handle(setRepositoryRpc, async ({ id, path: where }) => {
+    const problem = repositoryIdProblem(id);
+    if (problem) throw new UserError(`"${id}": ${problem}`);
+    if (where !== null) {
+      const trimmed = where.trim();
+      if (!trimmed) throw new UserError("give the folder of the repository");
+      const pathProblem = repositoryPathProblem(trimmed);
+      if (pathProblem) throw new UserError(pathProblem);
+      const info = await stat(expandHome(trimmed)).catch(() => null);
+      if (!info?.isDirectory()) throw new UserError(`${trimmed} is not a folder on this host: clone the repository there first`);
+      await setExternalRepository(id, trimmed).catch((error: unknown) => {
+        throw new UserError(error instanceof Error ? error.message : String(error));
+      });
+    } else
+      await setExternalRepository(id, null).catch((error: unknown) => {
+        throw new UserError(error instanceof Error ? error.message : String(error));
+      });
+    return listExternalRepositories();
+  });
   handle(listProjectProfilesRpc, async ({ workspaces }) => {
     const projects = new Map<string, { projectId: string; label: string; root: string }>();
     for (const { projectId, workspaceId } of workspaces) {

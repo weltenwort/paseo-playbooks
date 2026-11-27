@@ -1,6 +1,6 @@
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { hasPlaybooks, loadSidekick, PLAYBOOKS_DIRS } from "./loader";
+import { hasOwnPlaybooks, loadSidekick, PLAYBOOKS_DIRS } from "./loader";
 import { SIDEKICK_STARTER_FILES } from "./sidekick";
 import { UserError } from "./runtime";
 
@@ -42,7 +42,8 @@ Return what you changed in the \`changes\` output.
  * relative to the workspace. Never overwrites: a file that already exists is an error.
  */
 export async function createStarter(workspaceDir: string): Promise<string[]> {
-  if (await hasPlaybooks(workspaceDir)) throw new UserError("this workspace already has playbooks");
+  // External repositories do not count: the starter goes in the workspace's own folder.
+  if (await hasOwnPlaybooks(workspaceDir)) throw new UserError("this workspace already has playbooks");
   const root = PLAYBOOKS_DIRS[0];
   const created: string[] = [];
   for (const [name, text] of Object.entries(STARTER_FILES)) {

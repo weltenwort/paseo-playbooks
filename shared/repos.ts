@@ -23,3 +23,14 @@ export function findEntry(entries: readonly PlaybookEntry[], ref: string): { ent
 export function qualified(entry: Pick<PlaybookEntry, "id" | "repo">): string {
   return `${entry.repo}:${bareId(entry.id)}`;
 }
+
+/**
+ * The entry an internal reference means (the panel's Start, a hand-off, a fan-out child, a stored run id): the exact id
+ * first, as ADR 2026-11-11-profiles says internal lookups use it, so a default playbook's bare `deploy` stays the default
+ * one when an external repository or profile also has a `deploy`. Ids that no longer match exactly (a bare id stored
+ * before its playbook was namespaced) go through `findEntry`.
+ */
+export function findInternal(entries: readonly PlaybookEntry[], ref: string): { entry: PlaybookEntry } | { error: string } | { entry: undefined } {
+  const exact = entries.find((entry) => entry.id === ref);
+  return exact ? { entry: exact } : findEntry(entries, ref);
+}

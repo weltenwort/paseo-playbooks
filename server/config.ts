@@ -1,4 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import path from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { pluginDataDir } from "./data-dir";
@@ -9,6 +11,28 @@ import { dayNumbers, parseClock, validTimezone, type ClosedHours } from "./close
 /** `<plugin data dir>/config.yaml` (data-dir.ts): the user's settings (profile activation is per project). */
 export function userConfigFile(): string {
   return path.join(pluginDataDir(), "config.yaml");
+}
+
+/**
+ * The config to change and write back: like `readConfig`, but a file that exists and does not parse (or is not a map)
+ * is an error, so a change from the panel never overwrites a file the user is still repairing.
+ */
+async function readConfigForWrite(file: string): Promise<Record<string, unknown>> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return {};
+  }
+  let value: unknown;
+  try {
+    value = parseYaml(text);
+  } catch (error) {
+    throw new Error(`${file} is not valid YAML (${error instanceof Error ? error.message.split("\n")[0] : String(error)}): fix it before changing settings here`);
+  }
+  if (value === null || value === undefined) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`${file} is not a map of settings: fix it before changing settings here`);
+  return value as Record<string, unknown>;
 }
 
 async function readConfig(file: string): Promise<Record<string, unknown>> {
@@ -50,7 +74,7 @@ export async function readProjectDefault(projectId: string, file: string = userC
  * profiles. `default` is not a list entry: turning it off writes `default: false`, turning it on removes that key.
  */
 export async function setProjectProfile(projectId: string, profile: string, active: boolean, file: string = userConfigFile()): Promise<string[]> {
-  const config = await readConfig(file);
+  const config = await readConfigForWrite(file);
   const current = await readProjectProfiles(projectId, file);
   const profiles = asRecord(config.profiles);
   const projects = asRecord(profiles.projects);
@@ -64,11 +88,93 @@ export async function setProjectProfile(projectId: string, profile: string, acti
     entry.active = next;
   }
   config.profiles = { ...profiles, projects: { ...projects, [projectId]: entry } };
+  await writeConfig(file, config);
+  return next;
+}
+
+/** A playbook repository outside the projects (`repositories.<id>` of the user config, ADR 2026-11-26-external-playbook-repositories). */
+export interface ExternalRepository {
+  /** The key: the prefix of its playbook ids (`mine:deploy`). */
+  id: string;
+  /** As written in the config (`~/src/my-playbooks`). */
+  path: string;
+  /** Absolute path on this host (`~` expanded). */
+  resolved: string;
+}
+
+const REPOSITORY_ID = /^[a-z][a-z0-9_-]*$/;
+
+/** Why `value` cannot be an external repository's folder (it must be absolute, `~` or `~/…`), or null. */
+export function repositoryPathProblem(value: string): string | null {
+  if (value === "~" || value.startsWith("~/") || path.isAbsolute(value)) return null;
+  return `"${value}": give an absolute path, or one starting with ~/ (relative paths and ~user are not supported)`;
+}
+
+/** `~` and `~/…` expanded to the home folder of this host; other paths resolved to absolute ones. */
+export function expandHome(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return path.join(homedir(), value.slice(2));
+  return path.resolve(value);
+}
+
+/** Why `id` cannot name an external repository, or null. */
+export function repositoryIdProblem(id: string): string | null {
+  if (id === DEFAULT_REPO) return "`default` is the project's own repository";
+  if (!REPOSITORY_ID.test(id)) return "repository ids use lowercase letters, digits, - and _, starting with a letter";
+  return null;
+}
+
+/**
+ * The external repositories of this host, in config order: `repositories: { <id>: { path } }`. A malformed entry is
+ * left out and described in `problems`: a bad config never blocks loading.
+ */
+export async function readExternalRepositories(file: string = userConfigFile()): Promise<{ repositories: ExternalRepository[]; problems: string[] }> {
+  const raw = (await readConfig(file)).repositories;
+  const repositories: ExternalRepository[] = [];
+  const problems: string[] = [];
+  if (raw === undefined || raw === null) return { repositories, problems };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { repositories, problems: ["repositories: must be a map of <id>: { path: <folder> }; ignored"] };
+  for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+    const idProblem = repositoryIdProblem(id);
+    if (idProblem) {
+      problems.push(`repositories.${id}: ${idProblem}; ignored`);
+      continue;
+    }
+    const where = asRecord(value).path;
+    if (typeof where !== "string" || where.trim() === "") {
+      problems.push(`repositories.${id}: needs a \`path\` (the folder of the repository); ignored`);
+      continue;
+    }
+    const pathProblem = repositoryPathProblem(where.trim());
+    if (pathProblem) {
+      problems.push(`repositories.${id}.path: ${pathProblem}; ignored`);
+      continue;
+    }
+    repositories.push({ id, path: where.trim(), resolved: expandHome(where.trim()) });
+  }
+  return { repositories, problems };
+}
+
+/**
+ * Adds (or moves) an external repository, or removes it with `path: null`, keeping the rest of the config. Removing only
+ * drops the config entry; the folder is never touched.
+ */
+export async function setExternalRepository(id: string, where: string | null, file: string = userConfigFile()): Promise<void> {
+  const config = await readConfigForWrite(file);
+  const repositories = { ...asRecord(config.repositories) };
+  if (where === null) delete repositories[id];
+  else repositories[id] = { ...asRecord(repositories[id]), path: where };
+  if (Object.keys(repositories).length === 0) delete config.repositories;
+  else config.repositories = repositories;
+  await writeConfig(file, config);
+}
+
+async function writeConfig(file: string, config: Record<string, unknown>): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
+  // Unique per write, so two changes at once never share (and clobber) a temp file.
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tmp, stringifyYaml(config), "utf8");
   await rename(tmp, file);
-  return next;
 }
 
 /** `event_core` of the user config (ADR 2026-11-12-event-core): the event log and its parity check. */

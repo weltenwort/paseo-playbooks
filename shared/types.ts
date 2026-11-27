@@ -495,15 +495,15 @@ export const RunScriptsSchema = z.object({
   /** The directory holding the copy: script paths (`<relDir>/scripts/<name>`) resolve inside it. */
   dir: z.string(),
   refreshedAt: z.string(),
-  /** Where the copy was taken from: `origin` (the fetched origin/<branch>) or `workspace` (the checkout, when origin's playbook is invalid). Runs from before read as origin. */
-  source: z.enum(["origin", "workspace"]).default("origin"),
+  /** Where the copy was taken from: `origin` (the fetched origin/<branch>), `workspace` (the checkout, when origin's playbook is invalid) or `external` (an external repository's folder; absolute script paths resolve inside the copy as `<dir>/<absolute path>`). Runs from before read as origin. */
+  source: z.enum(["origin", "workspace", "external"]).default("origin"),
 });
 export type RunScripts = z.infer<typeof RunScriptsSchema>;
 
 /** Where an isolated run's playbook definition (and roles) came from: see ADR 2026-11-10-playbooks-from-fresh-main. */
 export const RunDefinitionSchema = z.object({
-  /** `origin`: read from the run's worktree, off a freshly fetched origin/<base>; `workspace`: the shared checkout. */
-  source: z.enum(["origin", "workspace"]),
+  /** `origin`: read from the run's worktree, off a freshly fetched origin/<base>; `workspace`: the shared checkout; `external`: an external repository's folder (its HEAD in `sha` when it is a git checkout). */
+  source: z.enum(["origin", "workspace", "external"]),
   /** The ref and commit the definition was read at (origin only). */
   ref: z.string().nullable().default(null),
   sha: z.string().nullable().default(null),
@@ -519,6 +519,8 @@ export const PlaybookSchema = z.object({
   title: z.string(),
   description: z.string(),
   file: z.string(),
+  /** Set when the playbook comes from an external repository (ADR 2026-11-26-external-playbook-repositories): its absolute folder on the daemon host. */
+  external: z.object({ root: z.string() }).optional(),
   inputs: z.record(z.string(), VarDefSchema),
   outputs: z.record(z.string(), PlaybookOutputSchema),
   concurrency: z.number().int().positive().optional(),
@@ -635,13 +637,17 @@ export const ProfileInfoSchema = z.object({
   /** Playbook files in the profile's folder. */
   playbooks: z.number(),
   errors: z.array(z.string()).default([]),
+  /** `external`: a repository outside the projects, registered in the user config and always active (ADR 2026-11-26-external-playbook-repositories). */
+  source: z.enum(["workspace", "external"]).default("workspace"),
+  /** The folder of an external repository, as registered (`~/src/my-playbooks`). */
+  path: z.string().optional(),
 });
 export type ProfileInfo = z.infer<typeof ProfileInfoSchema>;
 
 export const PlaybookEntrySchema = z.object({
   /** `deploy` in the default repository, `louis:deploy` in the profile `louis`. */
   id: z.string(),
-  /** The repository it comes from: `default` or a profile id. */
+  /** The repository it comes from: `default`, a profile id or an external repository's id. */
   repo: z.string().default("default"),
   file: z.string(),
   title: z.string(),

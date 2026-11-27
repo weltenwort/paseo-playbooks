@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { access, constants, cp, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import path from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
@@ -11,7 +11,7 @@ type PaseoApi = PluginHandlerContext["paseo"];
 import type { AdmissionStatus, RunPriorityView, ScriptOutput, UsageReading } from "../shared/types";
 import type { DismissedFinding, GateWaitCondition } from "../shared/types";
 import { dismissRefusal, findingSignature, normalizeFindingFile, normalizeFindingText, normalizePr } from "./findings";
-import type { AgentSettings, AgentTarget, Attempt, FanoutChild as FanoutChildState, PoolPass as PoolPassState, Gate, Job, Playbook, Run, RunDefinition, RunWorktree, Step, VarValue, WardenFinding } from "../shared/types";
+import type { AgentSettings, AgentTarget, Attempt, FanoutChild as FanoutChildState, PoolPass as PoolPassState, Gate, Job, Playbook, Run, RunDefinition, RunScripts, RunWorktree, Step, VarValue, WardenFinding } from "../shared/types";
 import { addUsage, isUnavailableHold, DEFAULT_EXHAUSTED_FOR_MS, DEFAULT_PERMISSION_POLICY, workspaceKeptUntil } from "../shared/types";
 import { UsageLedger } from "./usage-ledger";
 import { type UsageRow, UsageLogWriter, USAGE_DIR } from "./usage-log";
@@ -44,14 +44,14 @@ import { assertBranchName } from "./branch-name";
 import { checkoutSnapshot, currentRef, defaultBranch, exportPaths, fastForward, freshenCheckout, freshRef, freshRefInfo, git as gitOutput, resolveCommit, removedGitlinks, snapshotDiff, checkoutViolationSince, unsavedWork } from "./git";
 import { workspaceTitle } from "../shared/workspace-name";
 import { createWorktree, diskUsedFraction, dirtyPaths, purgeScratch, linkedSubmodules, listWorktreeDirs, pruneWorktrees, unpushedCommits, removeWorktree, repoOfWorktree, worktreeBranch, worktreePath } from "./worktree";
-import { chooseDefinition, definitionMismatch, isAdoptable, readAtRef, resolveForNewRun, shortReason, workspaceWarning } from "./fresh";
+import { chooseDefinition, definitionMismatch, externalSha, isAdoptable, readAtRef, resolveForNewRun, shortReason, workspaceWarning } from "./fresh";
 import { runWorktreeTeardown } from "./teardown";
 import { gatesOnBehalfSetting, wardenPrSetting, loadPlaybooks, loadSidekick, type SidekickConfig, type SidekickProviders } from "./loader";
-import { findEntry } from "../shared/repos";
+import { findEntry, findInternal } from "../shared/repos";
 
 /** The entry a stored or typed playbook id means: bare ids resolve to the one namespaced entry (and the reverse); ambiguity or absence gives undefined. */
 function lookup(entries: Parameters<typeof findEntry>[0], ref: string) {
-  const found = findEntry(entries, ref);
+  const found = findInternal(entries, ref);
   return "entry" in found ? found.entry : undefined;
 }
 import { DEFAULT_SUBAGENT_ARCHIVE_AFTER_MS, subagentWorkspaceRefusal, SubagentArchiveStore } from "./sidekick-archive";
@@ -140,8 +140,8 @@ export interface RefreshResult {
   sha: string;
   before: string | null;
   changed: boolean;
-  /** `origin`: the fetched origin/<branch>; `workspace`: the checkout, because origin's playbook is invalid or missing (see `note`). */
-  source: "origin" | "workspace";
+  /** `origin`: the fetched origin/<branch>; `workspace`: the checkout, because origin's playbook is invalid or missing (see `note`); `external`: an external repository's folder. */
+  source: "origin" | "workspace" | "external";
   /** `refreshed`/`unchanged`: an ended run re-read its definition; `pinned`: kept (an active run, or no compatible definition: see `note`). */
   definition: "refreshed" | "unchanged" | "pinned";
   /** The warning or reason behind a fallback or a definition that was not replaced. */
@@ -1827,6 +1827,8 @@ export class Runtime {
       });
       // start_playbook with autoStart: false: the manager starts the steps ready now; later ones start by themselves.
       if (options.hold) run.held = engine.readySteps(run);
+      // An external repository's scripts are copied now, so editing or pulling it does not change a live run.
+      if (playbook.external) run.scripts = await this.copyExternalScripts(runId, playbook);
       await this.store.create(run);
     } catch (error) {
       if (worktree) await this.dropWorktree(runId, worktree, workspaceDir, true).catch(() => undefined);
@@ -1954,10 +1956,12 @@ export class Runtime {
         }
         const removed = await this.dropWorktree(candidate.id, wt, await this.repoOf(candidate, wt), false);
         this.cleanupBackoff.clear(candidate.id);
-        await this.dropRunScripts(candidate.id);
+        // An external repository's script copy is the run's own, not the worktree's: a restart still runs from it.
+        const keepScripts = candidate.scripts?.source === "external";
+        if (!keepScripts) await this.dropRunScripts(candidate.id);
         await this.store.mutate(candidate.id, (run) => {
           run.worktree = { ...wt, state: "removed" };
-          run.scripts = null;
+          if (!keepScripts) run.scripts = null;
           engine.noteEvent(run, "worktree_removed", null, `worktree ${wt.path} removed${removed.keptBranch ? `; branch ${removed.keptBranch} kept: it has commits that are not pushed` : `; branch ${wt.branch} deleted`}`, nowIso());
         });
       } catch (error) {
@@ -2038,6 +2042,8 @@ export class Runtime {
     for (const name of await readdir(this.runScriptsDir).catch(() => [] as string[])) {
       const record = runs.get(name);
       if (record?.worktree && record.worktree.state !== "removed") continue;
+      // An external repository's copy lives as long as its run, worktree or not (taken at start: ADR 2026-11-26-external-playbook-repositories).
+      if (record?.scripts?.source === "external") continue;
       await this.dropRunScripts(name);
     }
     for (const repo of new Set(this.store.list().map((run) => run.workspaceDir))) {
@@ -2082,6 +2088,7 @@ export class Runtime {
       const blocker = this.refreshBlocker(run);
       if (blocker) throw new UserError(`run ${runId} has ended (${run.status}) and cannot be restarted (${blocker}): its scripts are not run again`);
     }
+    if (run.playbook.external) return this.refreshExternalScripts(run, ended, reason, by);
     const wt = run.worktree;
     if (!wt || (wt.state === "removed" && !ended)) throw new UserError(`run ${runId} has no worktree: its scripts already run from the workspace checkout`);
     if (!wt.base.startsWith("origin/")) throw new UserError(`run ${runId}'s worktree was created from "${wt.base}", not from origin/<branch>: there is no fresh remote ref to refresh from`);
@@ -2103,7 +2110,8 @@ export class Runtime {
       const read = await readAtRef(repo, fresh.ref, { projectId: run.projectId });
       if ("error" in read) why = `the playbooks of ${fresh.ref} could not be read: ${shortReason(read.error)}`;
       else {
-        const entry = read.loaded.entries.find((candidate) => candidate.id === run.playbook.id);
+        // Only the project's own playbooks are on origin: an external repository's entry of the same id is not this run's.
+        const entry = read.loaded.entries.find((candidate) => candidate.id === run.playbook.id && !candidate.playbook?.external);
         if (!entry) why = `${fresh.ref} has no playbook "${run.playbook.id}"`;
         else if (!entry.playbook) why = `${fresh.ref} is invalid: ${shortReason(entry.errors[0] ?? "unknown error")}`;
         else if (!isAdoptable(entry)) why = `"${run.playbook.id}" on ${fresh.ref} is no longer an isolated, non-singleton playbook`;
@@ -2112,7 +2120,7 @@ export class Runtime {
       if (why) {
         source = "workspace";
         const local = await loadPlaybooks(run.workspaceDir, { projectId: run.projectId }).catch(() => null);
-        const entry = local?.entries.find((candidate) => candidate.id === run.playbook.id);
+        const entry = local?.entries.find((candidate) => candidate.id === run.playbook.id && !candidate.playbook?.external);
         next = isAdoptable(entry) ? entry.playbook : null;
       }
     }
@@ -2140,9 +2148,7 @@ export class Runtime {
     if (scriptsSame && !definitionChanged) return result(false);
     const final = path.join(this.runScriptsDir, runId);
     if (!scriptsSame) {
-      await mkdir(this.runScriptsDir, { recursive: true });
-      const tmp = await mkdtemp(path.join(this.runScriptsDir, `.${runId}.`));
-      try {
+      await this.installScriptCopy(runId, async (tmp) => {
         if (source === "origin") await exportPaths(repo, fresh.ref, [...dirs], tmp);
         else {
           for (const rel of dirs) {
@@ -2150,17 +2156,9 @@ export class Runtime {
             if (existsSync(from)) await cp(from, path.join(tmp, rel), { recursive: true });
           }
         }
-        // A script finds its checkout root with `git rev-parse --show-toplevel` (scratch dir `<root>/.tmp`): the copy must be one.
-        await gitOutput(tmp, ["init", "-q"]).catch(() => undefined);
-        // Written aside and renamed, so a running check never sees a half-written copy.
-        const old = `${tmp}.old`;
-        await rename(final, old).catch(() => undefined);
-        await rename(tmp, final);
-        await rm(old, { recursive: true, force: true }).catch(() => undefined);
-      } catch (error) {
-        await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+      }).catch((error: unknown) => {
         throw new UserError(`could not copy the scripts of ${label}: ${errorText(error)}`);
-      }
+      });
     }
     await this.store.mutate(runId, (current) => {
       if (!scriptsSame) current.scripts = { sha: scriptsSha, dir: final, refreshedAt: nowIso(), source };
@@ -2174,6 +2172,92 @@ export class Runtime {
     });
     if (record?.warning) await this.announceDefinitionFallback(runId, "refresh_scripts");
     return result(true);
+  }
+
+  /**
+   * Copies the script folders of an external repository's playbook into `<data>/run-scripts/<runId>`, under their
+   * absolute paths (`<dir>/<root>/scripts/x.sh`), as a git checkout. Null when the playbook has no script.
+   */
+  private async copyExternalScripts(runId: string, playbook: Playbook): Promise<RunScripts | null> {
+    const scripts = new Set<string>();
+    for (const step of playbook.steps) if (step.kind === "script" && step.script && path.isAbsolute(step.script)) scripts.add(step.script);
+    if (scripts.size === 0) return null;
+    const dirs = new Set([...scripts].map((file) => path.dirname(file)));
+    const dir = await this.installScriptCopy(runId, async (tmp) => {
+      // Links are followed, so no copied script still reaches into the live clone.
+      for (const from of dirs) if (existsSync(from)) await cp(from, path.join(tmp, from), { recursive: true, dereference: true });
+      // Checked before the copy replaces the previous one: a refresh that would lose a script is refused and the old copy kept.
+      const missing: string[] = [];
+      for (const file of scripts) {
+        const copied = path.join(tmp, file);
+        if (!(await access(copied, constants.X_OK).then(() => true, () => false))) missing.push(path.basename(file));
+      }
+      if (missing.length > 0) throw new Error(`${missing.map((name) => `scripts/${name}`).join(", ")} ${missing.length === 1 ? "is" : "are"} missing or not executable in ${playbook.external!.root}`);
+    });
+    return { sha: (await externalSha(playbook.external!.root)) ?? "external", dir, refreshedAt: nowIso(), source: "external" };
+  }
+
+  /** Fills a fresh `<data>/run-scripts/<runId>` with `fill`, as a git checkout, written aside and renamed into place; returns it. */
+  private async installScriptCopy(runId: string, fill: (tmp: string) => Promise<void>): Promise<string> {
+    const final = path.join(this.runScriptsDir, runId);
+    await mkdir(this.runScriptsDir, { recursive: true });
+    const tmp = await mkdtemp(path.join(this.runScriptsDir, `.${runId}.`));
+    try {
+      await fill(tmp);
+      // A script finds its checkout root with `git rev-parse --show-toplevel` (scratch dir `<root>/.tmp`): the copy must be one.
+      await gitOutput(tmp, ["init", "-q"]).catch(() => undefined);
+      // Written aside and renamed, so a running check never sees a half-written copy.
+      const old = `${tmp}.old`;
+      await rename(final, old).catch(() => undefined);
+      await rename(tmp, final);
+      await rm(old, { recursive: true, force: true }).catch(() => undefined);
+    } catch (error) {
+      await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+    return final;
+  }
+
+  /**
+   * `refresh_scripts` for a run of an external repository: the scripts (and, on an ended run, a compatible definition)
+   * are read again from the repository's folder as it is now. Nothing is fetched: pulling the clone is the user's job.
+   */
+  private async refreshExternalScripts(run: Run, ended: boolean, reason: string, by: string): Promise<RefreshResult> {
+    const runId = run.id;
+    const root = run.playbook.external!.root;
+    const label = `the external repository ${root}`;
+    const notes: string[] = [];
+    let definition: RefreshResult["definition"] = "pinned";
+    let next: Playbook | null = null;
+    if (ended) {
+      const loaded = await loadPlaybooks(run.workspaceDir, { projectId: run.projectId }).catch(() => null);
+      const entry = loaded?.entries.find((candidate) => candidate.id === run.playbook.id && candidate.playbook?.external?.root === root);
+      if (!entry?.playbook) notes.push(entry ? `the playbook is invalid in ${root} (${entry.errors[0] ?? "unknown error"}): the run keeps its pinned definition` : `${root} has no playbook "${run.playbook.id}" any more: the run keeps its pinned definition`);
+      else {
+        const mismatch = definitionMismatch(run.playbook, entry.playbook);
+        if (mismatch) notes.push(`the definition was not replaced: ${mismatch}; the run keeps its pinned definition (only the scripts were refreshed)`);
+        else {
+          next = entry.playbook;
+          definition = JSON.stringify(next) === JSON.stringify(run.playbook) ? "unchanged" : "refreshed";
+        }
+      }
+    }
+    const scripts = await this.copyExternalScripts(runId, next ?? run.playbook).catch((error: unknown) => {
+      throw new UserError(`could not copy the scripts of ${label}: ${errorText(error)}`);
+    });
+    if (!scripts) throw new UserError(`run ${runId} has no script step`);
+    const before = run.scripts?.sha ?? null;
+    const sha = await externalSha(root);
+    await this.store.mutate(runId, (current) => {
+      current.scripts = scripts;
+      if (next && definition !== "pinned") {
+        current.playbook = next;
+        current.definition = { source: "external", ref: null, sha, note: null, warning: null };
+      }
+      const defText = ended ? `; definition ${definition === "pinned" ? "kept pinned" : definition === "unchanged" ? "unchanged" : `re-read from ${label}`}` : "";
+      engine.noteEvent(current, "scripts_refreshed", null, `scripts refreshed from ${label} by ${by}: ${before ?? "live folder"} -> ${scripts.sha}${defText}${reason ? ` (${reason})` : ""}${notes.length > 0 ? `. ${notes.join("; ")}` : ""}`, nowIso());
+    });
+    return { ref: label, sha: scripts.sha, before, changed: true, source: "external", definition, note: notes.length > 0 ? notes.join("; ") : null };
   }
 
   /** Emits `run.definition_fallback` for a run whose definition came from the workspace checkout; never fails. */
@@ -3713,6 +3797,8 @@ export class Runtime {
     });
     const previous = this.batchesOf(pipelineId).find((batch) => batch.batch!.stage === stageId);
     const batch = engine.newBatchRun({ id: `run_${shortId()}`, pipeline, stage: stageId, jobs, managerAgentId: manager.id, now: nowIso() });
+    // A batch of an external repository's singleton runs its step scripts from a copy, like any run; admission scripts stay live.
+    if (batch.playbook.external) batch.scripts = await this.copyExternalScripts(batch.id, batch.playbook);
     await this.store.create(batch);
     await this.store.mutate(pipelineId, (current) => engine.joinBatch(current, stageId, batch.id, jobs.map((job) => job.id), nowIso()));
     // The stage's previous batch manager is done: one manager per stage in the workspace.
@@ -4109,9 +4195,11 @@ export class Runtime {
     try {
       // An isolated run's scripts run in its worktree; one the worktree's commit lacks (uncommitted in the workspace) runs from the workspace.
       // After refresh_scripts, the run's own copy of origin/<branch>'s scripts comes first.
+      // An external repository's script has an absolute path: its copy (taken at start) first, then the repository's folder.
       const refreshed = run.scripts ? path.join(run.scripts.dir, step.script!) : null;
-      const inWorktree = run.worktree ? path.join(run.worktree.path, step.script!) : null;
-      const scriptFile = refreshed && existsSync(refreshed) ? refreshed : inWorktree && existsSync(inWorktree) ? inWorktree : path.join(run.workspaceDir, step.script!);
+      const external = path.isAbsolute(step.script!);
+      const inWorktree = run.worktree && !external ? path.join(run.worktree.path, step.script!) : null;
+      const scriptFile = refreshed && existsSync(refreshed) ? refreshed : inWorktree && existsSync(inWorktree) ? inWorktree : path.resolve(run.workspaceDir, step.script!);
       if (!existsSync(scriptFile)) {
         // Fail fast with where it looked, instead of a bare ENOENT: a checkout behind origin is the usual cause.
         const dir = engine.workDir(run);
@@ -4372,12 +4460,13 @@ export class Runtime {
     };
     try {
       // The pipeline's workspace is where its scripts live; one a newer commit added is read once the pipeline is between batches.
-      let file = path.join(pipeline.workspaceDir, stage.admit.script);
+      // An external repository's admission script has an absolute path: `resolve` keeps it.
+      let file = path.resolve(pipeline.workspaceDir, stage.admit.script);
       if (!existsSync(file) && existsSync(pipeline.workspaceDir) && !this.batchesOf(pipeline.id).some((batch) => !isTerminal(batch.status))) {
         const id = pipeline.id;
         await this.refreshPipeline(id).catch((error: unknown) => console.error(`[playbooks] could not refresh ${id}:`, errorText(error)));
         pipeline = this.store.get(id)!;
-        file = path.join(pipeline.workspaceDir, stage.admit.script);
+        file = path.resolve(pipeline.workspaceDir, stage.admit.script);
       }
       if (!existsSync(pipeline.workspaceDir)) return finish({ kind: "failed", message: `the pipeline's workspace ${pipeline.workspaceDir} does not exist` });
       if (!existsSync(file)) return finish({ kind: "failed", message: `${stage.admit.script} not found in the pipeline's workspace ${pipeline.workspaceDir}` });

@@ -44,6 +44,34 @@ export const listProjectProfilesRpc = defineRpc({
   output: z.object({ projects: z.array(ProjectProfilesSchema) }),
 });
 
+export const ExternalRepositorySchema = z.object({
+  /** The key in the user config: the prefix of its playbook ids (`mine:deploy`). */
+  id: z.string(),
+  /** As registered (`~/src/my-playbooks`). */
+  path: z.string(),
+  /** Absolute folder on the daemon host. */
+  resolved: z.string(),
+  /** Playbook files at the folder's root. */
+  playbooks: z.number(),
+  /** Why it loads nothing (missing folder, no playbook files). */
+  problem: z.string().nullable(),
+});
+export type ExternalRepositoryInfo = z.infer<typeof ExternalRepositorySchema>;
+
+/** The external playbook repositories of this host (`repositories` of the user config), always active in every project. */
+export const listRepositoriesRpc = defineRpc({
+  name: "playbooks.list-repositories",
+  input: z.object({}),
+  output: z.object({ repositories: z.array(ExternalRepositorySchema), problems: z.array(z.string()).default([]) }),
+});
+
+/** Registers (or moves) an external repository, or removes it with `path: null`; removing never touches the folder. */
+export const setRepositoryRpc = defineRpc({
+  name: "playbooks.set-repository",
+  input: z.object({ id: z.string(), path: z.string().nullable() }),
+  output: z.object({ repositories: z.array(ExternalRepositorySchema), problems: z.array(z.string()).default([]) }),
+});
+
 /** The human restarts a project's Sidekick: the old agent is archived and a new one starts from its saved hand-off. */
 export const restartSidekickRpc = defineRpc({
   name: "sidekick.restart",
