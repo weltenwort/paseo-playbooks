@@ -51,6 +51,8 @@ steps:
 - **Workflows versionnés** : les playbooks, les rôles partagés et les réglages par défaut
   des agents vivent dans `.paseo/plugins/playbooks/`. Voir la
   [référence du format](https://playbooks.paseo.lerenn.dev/reference.html).
+- **Dépôts externes** : gardez vos propres playbooks dans un dépôt git à part, clonez-le sur
+  chaque machine et enregistrez le dossier. Ses playbooks sont alors disponibles dans tous les projets.
 - **Étapes en parallèle et boucles** : les étapes forment un graphe via `needs`, et les
   boucles reviennent en arrière avec `goto` et une limite. Les after-tasks, comme une
   rétrospective, s'exécutent à la fin de l'exécution.

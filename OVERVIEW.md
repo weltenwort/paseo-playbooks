@@ -47,6 +47,8 @@ steps:
 
 - **Workflows as code**: playbooks, shared roles and agent defaults live in
   `.paseo/plugins/playbooks/`. See the [format reference](https://playbooks.paseo.lerenn.dev/reference.html).
+- **External repositories**: keep your own playbooks in a git repository of their own, clone it on each
+  machine and register the folder. Its playbooks are then available in every project.
 - **Parallel steps and loops**: steps form a graph through `needs`, and loops go back with
   `goto` and a limit. After-tasks, such as a retro, run once the run ends.
 - **Script steps**: deterministic work, such as waiting for a PR to merge or a deploy to

@@ -568,6 +568,33 @@ playbooks are named `<profile>:<id>` (`louis:deploy`), and resolve their roles a
 inside the profile. If two repositories share an id, both are kept, and a bare `deploy` is refused as
 ambiguous: write `default:deploy` or `louis:deploy`.
 
+### External repositories
+
+To use the same playbooks in every project, keep them in a repository of their own and register its clone as an
+**external repository** (ADR `docs/adrs/2026-11-26-external-playbook-repositories.md`). The repository has the
+playbooks folder's layout at its root: playbook files, `roles/`, `defaults/`, `scripts/` and an optional
+`sidekick/`. Register it in the **External repositories** section of the Profiles tab (an id and a folder), or in
+`$PASEO_HOME/plugin-data/lerenn/paseo-playbooks/config.yaml`:
+
+```yaml
+repositories:
+  mine:
+    path: ~/src/my-playbooks   # absolute, or starting with ~; a folder on the daemon's host
+```
+
+An external repository is active in every project on that host and cannot be turned off per project; the
+dropdowns show it as a locked row. Its playbooks are `<id>:<playbook>` (`mine:deploy`, or a bare `deploy` when no
+other repository has one), and they resolve roles and sub-playbooks only inside it. The plugin never clones or
+pulls: to set up another machine, clone the repository there and register it; to update, `git pull` the clone.
+A run copies the repository's scripts when it starts, so a pull does not change a live run (`refresh_scripts`
+copies them again, and refuses if a script the run uses is missing, keeping the previous copy). Its Sidekick is used only when the project has none of its own, and its `defaults/main.yaml`
+supplies `reload_stale_sessions`, `warden.pr_checks` and `gates.on_behalf` when the project does not set them
+(a `warden` or `gates` block in the project's own defaults wins as a whole).
+A project profile with the same id as an external repository is ignored. Removing a repository only drops the
+config entry: the folder is kept. In a workspace whose only playbooks are external, agents get just `list_playbooks`
+and `start_playbook` (each run started gets a Playbook Manager of its own), not the full manager tools; a workspace
+with playbooks of its own keeps them all.
+
 To use playbooks in a repository, copy `examples/.paseo/plugins/playbooks/` into it (as
 `.paseo/plugins/playbooks/`),
 adjust the roles and playbooks and commit them. Then open the Playbooks panel in a workspace of
@@ -611,7 +638,9 @@ has the same workspace name field.
 Step agents (including managerless implementers and reviewers) receive the read-only
 `validate_playbooks` tool alongside `report_step_result`. It defaults to the caller’s working
 folder and resolves active profiles from the caller’s workspace project. An optional `path`
-changes only the folder to inspect, so it does not select another project’s profiles. Check
+changes only the folder to inspect, so it does not select another project’s profiles. The
+external repositories are always included; a `path` laid out as a repository itself (a registered
+external repository, or a folder with `roles/` at its root, such as a clone of one) is validated alone. Check
 that the returned results include the intended playbooks: an empty list is not a validation
 pass for them. Step agents receive no additional manager controls.
 
@@ -633,6 +662,13 @@ with that tag.
 
 ## Known limits
 
+- An external repository is registered per host: each Paseo host needs its own clone and its own entry
+  in the user config, and the plugin never pulls it.
+- In a workspace whose only playbooks are external, a chat that calls `start_playbook` with the same
+  playbook and identical inputs at the moment the panel starts that playbook can take the run that was
+  meant for the new Playbook Manager, without the tools to manage it. Cancel and start it again.
+- Downgrading past the version that added external repositories hides the runs started from them until
+  you upgrade again.
 - Reloading the plugin (`paseo plugin reload`) removes the playbook tools from agents that
   are already running. They get the tools back when their session restarts.
 - If the daemon restarts before a busy agent's queued kickoff is delivered, the kickoff is

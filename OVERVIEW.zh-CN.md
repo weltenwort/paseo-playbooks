@@ -41,6 +41,7 @@ steps:
 ## 功能
 
 - **工作流即代码**：playbook、共享角色和智能体默认配置都放在 `.paseo/plugins/playbooks/` 中。参见[格式参考](https://playbooks.paseo.lerenn.dev/reference.html)。
+- **外部仓库**：把你自己的 playbook 放在一个独立的 git 仓库中，在每台机器上克隆并注册该文件夹，其 playbook 即可在所有项目中使用。
 - **并行步骤和循环**：步骤通过 `needs` 组成一张图，循环通过带次数上限的 `goto` 回跳。收尾任务（例如复盘）在运行结束后执行。
 - **脚本步骤**：确定性的工作（例如等待 PR 合并或部署完成）以 playbook 的 `scripts/` 目录中的脚本运行，无需智能体。
 - **人工审批**：在面板或对话中批准、拒绝或选择一个选项。

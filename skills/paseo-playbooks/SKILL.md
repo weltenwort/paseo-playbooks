@@ -46,6 +46,13 @@ legacy location: it is still read, as part of the default repository, but move i
   `default` repository, on unless the user turns it off for a project. The user turns profiles on per project (Profiles tab of the Playbooks screen, or the panel's dropdown; off by default, applies to all workspaces of the project).
   A profile's playbook is `<profile>:<id>` (`louis:deploy`) and resolves roles and sub-playbooks only inside
   its profile. A bare id shared by two repositories is ambiguous: use `default:deploy` or `louis:deploy`.
+- **External repositories**: a folder outside the projects (typically a git clone of the user's own
+  catalog) with this same layout at its root: playbook files, `roles/`, `defaults/`, `scripts/` and an optional
+  `sidekick/`. The user registers it in the plugin's user config (`repositories: { mine: { path: ~/src/my-playbooks } }`,
+  or the Profiles tab), and it is then active in every project on that host. Its playbooks are `<id>:<playbook>`
+  (`mine:deploy`) and resolve roles and sub-playbooks only inside it. To change one, edit and commit in that
+  repository's checkout, not in the project; `validate_playbooks { path: <that checkout> }` validates it alone.
+  The plugin never pulls it: changes reach runs once the registered clone is updated.
 - Ids (playbooks, roles, steps, inputs, outputs) use lowercase letters, digits, `-` and `_`,
   and start with a letter.
 - A playbook refers to a role by its directory name. Roles are shared by playbooks.
@@ -60,7 +67,8 @@ It is defined by the `sidekick/` folder (a folder, so it never takes a playbook 
 its tab offers "Create the Sidekick files".
 
 A Sidekick may also live in `profiles/<id>/sidekick/`. Only active profiles participate; the first
-alphabetically wins, ahead of the top-level folder, with warnings for ignored folders. Use
+alphabetically wins, ahead of the top-level folder, with warnings for ignored folders. Last comes the first
+external repository (config order) with a `sidekick/` folder: it is used only when the project has none. Use
 `sidekick: { tier: worker, subagents: { tier: worker } }` to resolve targets from the containing
 repository/profile's `defaults/main.yaml`. Multi-entry tiers cannot have inline agent overrides.
 Profile `agent_rules` apply to the Sidekick and its subagent briefs. The Sidekick skips targets at
